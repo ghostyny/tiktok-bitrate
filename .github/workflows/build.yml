@@ -28,7 +28,7 @@ jobs:
           cat > control <<'EOF_control'
           Package: com.user.ttlogger
           Name: TTLogger
-          Version: 0.2
+          Version: 0.3
           Architecture: iphoneos-arm
           Description: TikTok fps logger
           Maintainer: user
@@ -211,6 +211,8 @@ jobs:
               if (ok) [gHooked addObject:key];
           }
 
+          static void DumpMethods(void);
+
           static void InstallHooks(void) {
               if (!gHooked) gHooked = [NSMutableSet set];
               BOOL f = kForceMaxFps > 0;
@@ -242,6 +244,64 @@ jobs:
               Hook("TTKMediaGear", "setFps:", NO, 0);
               Hook("TTVideoEngineURLInfo", "setFps:", NO, 0);
               Hook("IESVideoPreloadBitRateInfo", "setFps:", NO, 0);
+
+              // Дамп методов плеера: один раз, как только классы плеера появились в рантайме.
+              if (objc_getClass("TTVideoEngine") && objc_getClass("TTKMainOwnPlayer")) DumpMethods();
+          }
+
+          #pragma mark - Discovery dump
+
+          // Один раз через ~20с после старта пишет в Documents/ttfps_methods.txt список методов
+          // плеера, связанных с fps/bitrate/gear/definition/resolution/select/stream.
+          // По нему найдём, где реально выбирается поток (30 или 60 fps).
+          static BOOL ClassInteresting(const char *n) {
+              static const char *pre[] = {"TTVideoEngine", "TTKMain", "TTKMedia", "TTKPlayer", "IESVideoPreload", "AWEVideo", NULL};
+              for (int i = 0; pre[i]; i++) if (strncmp(n, pre[i], strlen(pre[i])) == 0) return YES;
+              return NO;
+          }
+
+          static BOOL MethodInteresting(const char *n) {
+              static const char *keys[] = {"fps", "framerate", "bitrate", "gear", "definition", "resolution", "quality", "select", "choose", "stream", "playaddr", NULL};
+              for (int i = 0; keys[i]; i++) if (strcasestr(n, keys[i])) return YES;
+              return NO;
+          }
+
+          static void DumpMethods(void) {
+              static BOOL done;
+              if (done) return;
+              done = YES;
+              NSMutableString *out = [NSMutableString string];
+              NSMutableArray<NSArray<NSString *> *> *autoHooks = [NSMutableArray array];
+              unsigned cnt = 0;
+              Class *list = objc_copyClassList(&cnt);
+              int lines = 0;
+              for (unsigned i = 0; i < cnt && lines < 6000; i++) {
+                  const char *cn = class_getName(list[i]);
+                  if (!ClassInteresting(cn)) continue;
+                  for (int meta = 0; meta < 2; meta++) {
+                      Class c = meta ? object_getClass(list[i]) : list[i];
+                      unsigned mc = 0;
+                      Method *ms = class_copyMethodList(c, &mc);
+                      for (unsigned j = 0; j < mc; j++) {
+                          const char *sn = sel_getName(method_getName(ms[j]));
+                          if (!MethodInteresting(sn)) continue;
+                          const char *te = method_getTypeEncoding(ms[j]);
+                          [out appendFormat:@"%c[%s %s] %s\n", meta ? '+' : '-', cn, sn, te ? te : ""];
+                          lines++;
+                          // Сеттеры fps/framerate хукаем автоматически. Геттеры не трогаем: их дёргают на каждый кадр.
+                          if (!meta && strncmp(sn, "set", 3) == 0 && strchr(sn, ':') && strchr(sn, ':') == strrchr(sn, ':')
+                              && (strcasestr(sn, "fps") || strcasestr(sn, "framerate")))
+                              [autoHooks addObject:@[[NSString stringWithUTF8String:cn], [NSString stringWithUTF8String:sn]]];
+                      }
+                      free(ms);
+                  }
+              }
+              free(list);
+              [out enumerateLinesUsingBlock:^(NSString *l, BOOL *stop) { TTLog(@"DUMP %@", l); }];
+              TTLog(@"DUMP done: %d methods, %lu auto-hooks", lines, (unsigned long)autoHooks.count);
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  for (NSArray<NSString *> *p in autoHooks) Hook(p[0].UTF8String, p[1].UTF8String, NO, 0);
+              });
           }
 
           #pragma mark - Share button
