@@ -142,9 +142,14 @@ jobs:
                   if (!IsIntClass(args[i - 2])) return NO;
               }
               NSString *cn = NSStringFromClass(cls), *sn = NSStringFromSelector(sel);
-              char retCopy[64]; memcpy(retCopy, ret, 64);
-              char a0[64], a1[64], a2[64], a3[64];
-              memcpy(a0, args[0], 64); memcpy(a1, args[1], 64); memcpy(a2, args[2], 64); memcpy(a3, args[3], 64);
+              // Блоки не умеют захватывать C-массивы, поэтому типы храним в NSString.
+              NSString *retStr = [NSString stringWithUTF8String:ret];
+              NSArray<NSString *> *typeStrs = @[
+                  [NSString stringWithUTF8String:args[0]],
+                  [NSString stringWithUTF8String:args[1]],
+                  [NSString stringWithUTF8String:args[2]],
+                  [NSString stringWithUTF8String:args[3]]
+              ];
               unsigned argc = n - 2;
               __block IMP orig = method_getImplementation(m);
 
@@ -154,11 +159,10 @@ jobs:
                   if (hasForce && argc >= 1) a = (uintptr_t)force;
                   uintptr_t r = ((uintptr_t (*)(id, SEL, uintptr_t, uintptr_t, uintptr_t, uintptr_t))orig)(self_, sel, a, b, c, d);
                   NSMutableString *s = [NSMutableString stringWithFormat:@"%@(%p) %@", cn, self_, sn];
-                  const char *types[4] = {a0, a1, a2, a3};
                   uintptr_t vals[4] = {origA, b, c, d};
-                  for (unsigned i = 0; i < argc; i++) [s appendFormat:@" arg%u=%@", i, Desc(types[i], vals[i])];
+                  for (unsigned i = 0; i < argc; i++) [s appendFormat:@" arg%u=%@", i, Desc(typeStrs[i].UTF8String, vals[i])];
                   if (hasForce) [s appendFormat:@" [FORCED -> %lld]", force];
-                  if (FirstType(retCopy) != 'v') [s appendFormat:@" => %@", Desc(retCopy, r)];
+                  if (FirstType(retStr.UTF8String) != 'v') [s appendFormat:@" => %@", Desc(retStr.UTF8String, r)];
                   TTLog(@"%@", s);
                   return r;
               };
@@ -317,7 +321,8 @@ jobs:
       - name: Collect dylib
         run: |
           mkdir -p out
-          cp .theos/obj/*.dylib out/
+          find .theos -name "*.dylib" -exec cp {} out/ \;
+          ls -la out
 
       - uses: actions/upload-artifact@v4
         with:
