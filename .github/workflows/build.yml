@@ -1,0 +1,131 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create tweak files
+        run: |
+          cat > Makefile <<'EOF_Makefile'
+          TARGET := iphone:clang:latest:14.0
+          ARCHS = arm64
+
+          include $(THEOS)/makefiles/common.mk
+
+          TWEAK_NAME = TTLogger
+          TTLogger_FILES = Tweak.x
+          TTLogger_CFLAGS = -fobjc-arc
+
+          include $(THEOS_MAKE_PATH)/tweak.mk
+          EOF_Makefile
+          cat > control <<'EOF_control'
+          Package: com.user.ttlogger
+          Name: TTLogger
+          Version: 0.1
+          Architecture: iphoneos-arm
+          Description: Logs TikTok player classes
+          Maintainer: user
+          Author: user
+          Section: Tweaks
+          EOF_control
+          cat > Tweak.x <<'EOF_Tweak_x'
+          #import <Foundation/Foundation.h>
+          #import <objc/runtime.h>
+
+          static NSString *LogPath(NSString *name) {
+              NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+              return [dir stringByAppendingPathComponent:name];
+          }
+
+          static void DumpClasses(NSString *fileName) {
+              NSArray *keys = @[@"player", @"bitrate", @"resolution", @"playaddr",
+                                @"fps", @"framerate", @"gear", @"videomodel",
+                                @"videoengine", @"urlmodel", @"playinfo"];
+              NSArray *skipPrefixes = @[@"NS", @"UI", @"_", @"CA", @"WK", @"SK"];
+
+              unsigned int count = 0;
+              Class *classes = objc_copyClassList(&count);
+              NSMutableString *out = [NSMutableString string];
+
+              for (unsigned int i = 0; i < count; i++) {
+                  Class c = classes[i];
+                  const char *image = class_getImageName(c);
+                  if (image && (strncmp(image, "/System/", 8) == 0 || strncmp(image, "/usr/lib", 8) == 0)) continue;
+
+                  NSString *name = NSStringFromClass(c);
+                  BOOL skip = NO;
+                  for (NSString *p in skipPrefixes) if ([name hasPrefix:p]) { skip = YES; break; }
+                  if (skip) continue;
+
+                  NSString *low = name.lowercaseString;
+                  BOOL match = NO;
+                  for (NSString *k in keys) if ([low containsString:k]) { match = YES; break; }
+                  if (!match) continue;
+
+                  Class sup = class_getSuperclass(c);
+                  [out appendFormat:@"\n@interface %@ : %@\n", name, sup ? NSStringFromClass(sup) : @"nil"];
+
+                  unsigned int mc = 0;
+                  Method *ms = class_copyMethodList(c, &mc);
+                  for (unsigned int j = 0; j < mc; j++)
+                      [out appendFormat:@"- %s\n", sel_getName(method_getName(ms[j]))];
+                  free(ms);
+
+                  unsigned int cc = 0;
+                  Method *cms = class_copyMethodList(object_getClass(c), &cc);
+                  for (unsigned int j = 0; j < cc; j++)
+                      [out appendFormat:@"+ %s\n", sel_getName(method_getName(cms[j]))];
+                  free(cms);
+
+                  unsigned int pc = 0;
+                  objc_property_t *ps = class_copyPropertyList(c, &pc);
+                  for (unsigned int j = 0; j < pc; j++)
+                      [out appendFormat:@"@property %s\n", property_getName(ps[j])];
+                  free(ps);
+              }
+              free(classes);
+
+              [out writeToFile:LogPath(fileName) atomically:YES encoding:NSUTF8StringEncoding error:nil];
+          }
+
+          %ctor {
+              // Marker: proves the dylib was injected and runs
+              NSString *marker = [NSString stringWithFormat:@"loaded at %@", [NSDate date]];
+              [marker writeToFile:LogPath(@"ttlogger_loaded.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 25 * NSEC_PER_SEC),
+                             dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                  DumpClasses(@"ttlogger_classes.txt");
+              });
+          }
+          EOF_Tweak_x
+          echo '{ Filter = { Bundles = ( "com.apple.UIKit" ); }; }' > TTLogger.plist
+
+      - name: Install tools
+        run: |
+          brew install make ldid
+          echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
+
+      - name: Install Theos
+        run: |
+          git clone --recursive --depth=1 https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Build
+        run: make FINALPACKAGE=1
+
+      - name: Collect dylib
+        run: |
+          mkdir -p out
+          cp .theos/obj/*.dylib out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dylib
+          path: out/
