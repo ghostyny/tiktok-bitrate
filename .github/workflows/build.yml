@@ -28,368 +28,95 @@ jobs:
           cat > control <<'EOF_control'
           Package: com.user.ttlogger
           Name: TTLogger
-          Version: 0.3
+          Version: 1.0
           Architecture: iphoneos-arm
-          Description: TikTok fps logger
+          Description: TikTok force 60 fps
           Maintainer: user
           Author: user
           Section: Tweaks
           EOF_control
           cat > TTFpsLogger.m <<'EOF_Tweak_m'
-          // TTFpsLogger.m
-          // Лог + (опционально) форс fps в TikTok. Без Substrate/Logos: чистый ObjC runtime,
-          // работает в dylib, внедрённом через переподпись (LCSign и т.п.).
-          //
-          // Лог пишется в Documents/ttfps_log.txt внутри контейнера TikTok.
-          // На экране слева появляется кнопка "LOG": нажми -> откроется Share Sheet,
-          // отправь файл себе (Telegram / Сохранить в Файлы / AirDrop).
+          // TTFpsLogger.m - финальная версия.
+          // Убирает из списка вариантов видео 30-fps копии, если среди них есть 60-fps.
+          // Без логов, без кнопок, без записи файлов.
 
           #import <Foundation/Foundation.h>
           #import <UIKit/UIKit.h>
           #import <objc/runtime.h>
           #import <objc/message.h>
-          #include <stdarg.h>
           #include <string.h>
 
-          // ======================= НАСТРОЙКИ =======================
-          // 0 = только логировать. 60 = принудительно ставить maxFps=60 у TTVideoEngineOptions.
-          static const long long kForceMaxFps = 60;
-          // =========================================================
-
-          #pragma mark - Logging
-
-          static NSString *LogPath(void) {
-              NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-              return [dir stringByAppendingPathComponent:@"ttfps_log.txt"];
-          }
-
-          static void TTLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
-          static void TTLog(NSString *fmt, ...) {
-              va_list ap;
-              va_start(ap, fmt);
-              NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-              va_end(ap);
-              NSLog(@"[TTFps] %@", msg);
-
-              static dispatch_queue_t q;
-              static dispatch_once_t once;
-              dispatch_once(&once, ^{ q = dispatch_queue_create("ttfps.log", DISPATCH_QUEUE_SERIAL); });
-              NSTimeInterval ts = [[NSDate date] timeIntervalSince1970];
-              dispatch_async(q, ^{
-                  NSString *line = [NSString stringWithFormat:@"%.3f %@\n", ts, msg];
-                  NSString *path = LogPath();
-                  NSFileManager *fm = [NSFileManager defaultManager];
-                  NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
-                  if (!attr || [attr fileSize] > 3 * 1024 * 1024) {
-                      [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-                      return;
-                  }
-                  NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
-                  [h seekToEndOfFile];
-                  [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-                  [h closeFile];
-              });
-          }
-
-          #pragma mark - Type helpers
-
-          static char FirstType(const char *t) {
-              while (*t == 'r' || *t == 'n' || *t == 'N' || *t == 'o' || *t == 'O' || *t == 'R' || *t == 'V') t++;
-              return *t;
-          }
-          static BOOL IsIntClass(const char *t) {
-              char c = FirstType(t);
-              return c != 0 && strchr("cCsSiIlLqQB@#:^*", c) != NULL;
-          }
-          static NSString *Desc(const char *enc, uintptr_t v) {
-              char c = FirstType(enc);
-              switch (c) {
-                  case 'B': case 'c': case 'C': return [NSString stringWithFormat:@"%d", (int)(v & 0xFF)];
-                  case 's': case 'S': return [NSString stringWithFormat:@"%d", (int)(v & 0xFFFF)];
-                  case 'i': case 'I': case 'l': case 'L': return [NSString stringWithFormat:@"%d", (int)(v & 0xFFFFFFFF)];
-                  case 'q': case 'Q': return [NSString stringWithFormat:@"%lld", (long long)v];
-                  case ':': return v ? NSStringFromSelector((SEL)v) : @"nil";
-                  case '@': {
-                      if (enc[1] == '?') return @"<block>";
-                      if (!v) return @"nil";
-                      @try {
-                          NSString *d = [(__bridge id)(void *)v description];
-                          if (d.length > 200) d = [[d substringToIndex:200] stringByAppendingString:@"..."];
-                          return [d stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
-                      } @catch (__unused id e) { return @"<obj>"; }
-                  }
-                  default: return [NSString stringWithFormat:@"0x%lx", (unsigned long)v];
-              }
-          }
-
-          #pragma mark - Hooking
-
+          static const long long kHighFps = 50;
           static NSMutableSet<NSString *> *gHooked;
 
-          // Хук для методов, где все аргументы/возврат целочисленные или указатели (до 4 аргументов).
-          // force: если hasForce, подменяет ПЕРВЫЙ аргумент.
-          static BOOL HookGeneric(Class cls, SEL sel, BOOL hasForce, long long force) {
-              Method m = class_getInstanceMethod(cls, sel);
-              if (!m) return NO;
-              unsigned n = method_getNumberOfArguments(m);
-              if (n > 6) return NO;
-              char ret[64];
-              method_getReturnType(m, ret, sizeof ret);
-              if (FirstType(ret) != 'v' && !IsIntClass(ret)) return NO;
-              char args[4][64] = {{0}};
-              for (unsigned i = 2; i < n; i++) {
-                  method_getArgumentType(m, i, args[i - 2], 64);
-                  if (!IsIntClass(args[i - 2])) return NO;
+          static long long ModelFps(id m) {
+              SEL s = sel_registerName("fps");
+              if (!m || ![m respondsToSelector:s]) return -1;
+              return ((long long (*)(id, SEL))objc_msgSend)(m, s);
+          }
+
+          static NSArray *FilterModels(id owner, NSArray *arr, const void *key) {
+              if (![arr isKindOfClass:NSArray.class] || arr.count < 2) return arr;
+              NSArray *cache = objc_getAssociatedObject(owner, key);
+              if (cache.count == 2 && cache[0] == arr) return cache[1];
+
+              BOOL hasHigh = NO;
+              for (id m in arr) if (ModelFps(m) >= kHighFps) { hasHigh = YES; break; }
+
+              NSArray *result = arr;
+              if (hasHigh) {
+                  NSMutableArray *keep = [NSMutableArray array];
+                  for (id m in arr) {
+                      long long f = ModelFps(m);
+                      if (f <= 0 || f >= kHighFps) [keep addObject:m]; // fps неизвестен -> не трогаем
+                  }
+                  if (keep.count > 0 && keep.count < arr.count) result = [keep copy];
               }
-              NSString *cn = NSStringFromClass(cls), *sn = NSStringFromSelector(sel);
-              // Блоки не умеют захватывать C-массивы, поэтому типы храним в NSString.
-              NSString *retStr = [NSString stringWithUTF8String:ret];
-              NSArray<NSString *> *typeStrs = @[
-                  [NSString stringWithUTF8String:args[0]],
-                  [NSString stringWithUTF8String:args[1]],
-                  [NSString stringWithUTF8String:args[2]],
-                  [NSString stringWithUTF8String:args[3]]
-              ];
-              unsigned argc = n - 2;
-              __block IMP orig = method_getImplementation(m);
-
-              uintptr_t (^blk)(id, uintptr_t, uintptr_t, uintptr_t, uintptr_t) =
-              ^uintptr_t(id self_, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d) {
-                  uintptr_t origA = a;
-                  if (hasForce && argc >= 1) a = (uintptr_t)force;
-                  uintptr_t r = ((uintptr_t (*)(id, SEL, uintptr_t, uintptr_t, uintptr_t, uintptr_t))orig)(self_, sel, a, b, c, d);
-                  NSMutableString *s = [NSMutableString stringWithFormat:@"%@(%p) %@", cn, self_, sn];
-                  uintptr_t vals[4] = {origA, b, c, d};
-                  for (unsigned i = 0; i < argc; i++) [s appendFormat:@" arg%u=%@", i, Desc(typeStrs[i].UTF8String, vals[i])];
-                  if (hasForce) [s appendFormat:@" [FORCED -> %lld]", force];
-                  if (FirstType(retStr.UTF8String) != 'v') [s appendFormat:@" => %@", Desc(retStr.UTF8String, r)];
-                  TTLog(@"%@", s);
-                  return r;
-              };
-              class_replaceMethod(cls, sel, imp_implementationWithBlock(blk), method_getTypeEncoding(m));
-              return YES;
+              objc_setAssociatedObject(owner, key, @[arr, result], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+              return result;
           }
 
-          // Хук для сеттера с одним float/double аргументом.
-          static BOOL HookFloatSetter(Class cls, SEL sel, BOOL hasForce, double force) {
-              Method m = class_getInstanceMethod(cls, sel);
-              if (!m || method_getNumberOfArguments(m) != 3) return NO;
-              char ret[64], a[64];
-              method_getReturnType(m, ret, sizeof ret);
-              method_getArgumentType(m, 2, a, sizeof a);
-              if (FirstType(ret) != 'v') return NO;
-              char t = FirstType(a);
-              NSString *cn = NSStringFromClass(cls), *sn = NSStringFromSelector(sel);
-              IMP orig = method_getImplementation(m);
-              IMP newImp = NULL;
-              if (t == 'f') {
-                  newImp = imp_implementationWithBlock(^(id self_, float v) {
-                      float nv = hasForce ? (float)force : v;
-                      TTLog(@"%@(%p) %@ %f%@", cn, self_, sn, v, hasForce ? @" [FORCED]" : @"");
-                      ((void (*)(id, SEL, float))orig)(self_, sel, nv);
-                  });
-              } else if (t == 'd') {
-                  newImp = imp_implementationWithBlock(^(id self_, double v) {
-                      double nv = hasForce ? force : v;
-                      TTLog(@"%@(%p) %@ %f%@", cn, self_, sn, v, hasForce ? @" [FORCED]" : @"");
-                      ((void (*)(id, SEL, double))orig)(self_, sel, nv);
-                  });
-              } else return NO;
-              class_replaceMethod(cls, sel, newImp, method_getTypeEncoding(m));
-              return YES;
-          }
-
-          static void Hook(const char *cname, const char *sname, BOOL hasForce, long long force) {
-              NSString *key = [NSString stringWithFormat:@"%s %s", cname, sname];
-              if ([gHooked containsObject:key]) return;
+          static void HookModelsGetter(const char *cname, const char *sname) {
+              NSString *hk = [NSString stringWithFormat:@"%s %s", cname, sname];
+              if ([gHooked containsObject:hk]) return;
               Class cls = objc_getClass(cname);
               if (!cls) return;
               SEL sel = sel_registerName(sname);
-              if (!class_getInstanceMethod(cls, sel)) { TTLog(@"HOOK MISSING %@", key); [gHooked addObject:key]; return; }
-              BOOL ok = HookGeneric(cls, sel, hasForce, force) || HookFloatSetter(cls, sel, hasForce, (double)force);
-              TTLog(@"HOOK %@ %@", ok ? @"OK     " : @"SKIPPED", key);
-              if (ok) [gHooked addObject:key];
+              Method m = class_getInstanceMethod(cls, sel);
+              if (!m) { [gHooked addObject:hk]; return; }
+              char ret[64];
+              method_getReturnType(m, ret, sizeof ret);
+              if (ret[0] != '@' || method_getNumberOfArguments(m) != 2) { [gHooked addObject:hk]; return; }
+              const char *key = strdup(sname);
+              IMP orig = method_getImplementation(m);
+              IMP imp = imp_implementationWithBlock(^id(id self_) {
+                  id r = ((id (*)(id, SEL))orig)(self_, sel);
+                  return FilterModels(self_, r, key);
+              });
+              class_replaceMethod(cls, sel, imp, method_getTypeEncoding(m));
+              [gHooked addObject:hk];
           }
-
-          static void DumpMethods(void);
 
           static void InstallHooks(void) {
               if (!gHooked) gHooked = [NSMutableSet set];
-              BOOL f = kForceMaxFps > 0;
-
-              // --- Опции плеера (самый вероятный виновник) ---
-              Hook("TTVideoEngineOptions", "setMaxFps:", f, kForceMaxFps);
-              Hook("TTVideoEngineOptions", "setFramesDrop:", NO, 0);
-              Hook("TTVideoEngineOptions", "setEnableGearStrategy:", NO, 0);
-              Hook("TTVideoEngineOptions", "setEnableStartUpAutoResolution:", NO, 0);
-
-              // --- Сам движок ---
-              const char *eng[] = {
-                  "setDropFrameRate:", "setDropFrameMinFps:", "setDropFrameByUser:",
-                  "setCustomizedVideoRenderingFrameRate:", "setNnsrFpsThreshold:",
-                  "setCurrentResolution:", "switchToDefinition:params:", "switchBitrate:type:",
-                  "configResolution:", "configResolution:params:", "configResolution:completion:",
-                  "setHardwareDecode:", "playerVideoBitrateChanged:",
-                  "setOptionForKey:value:", "setIntOptionValue:forKey:", "setOptions:", NULL
-              };
-              for (int i = 0; eng[i]; i++) Hook("TTVideoEngine", eng[i], NO, 0);
-
-              // --- Плеер TikTok ---
-              Hook("TTKMainOwnPlayer", "setCustomizedVideoRenderingFrameRate:", NO, 0);
-              Hook("TTKMainOwnPlayer", "setNnsrFPSThreshold:", NO, 0);
-              Hook("TTKMainOwnPlayer", "switchStreamBitrate:ofType:completion:", NO, 0);
-              Hook("TTKMediaSuperResolutionConfig", "setFrameRateThreshold:", NO, 0);
-
-              // --- Какие варианты потока (gear) вообще приходят и с каким fps ---
-              Hook("TTKMediaGear", "setFps:", NO, 0);
-              Hook("TTVideoEngineURLInfo", "setFps:", NO, 0);
-              Hook("IESVideoPreloadBitRateInfo", "setFps:", NO, 0);
-
-              // Дамп методов плеера: один раз, как только классы плеера появились в рантайме.
-              if (objc_getClass("TTVideoEngine") && objc_getClass("TTKMainOwnPlayer")) DumpMethods();
+              HookModelsGetter("AWEVideoModel", "bitrateModels");
+              HookModelsGetter("AWEVideoModel", "SDRBitrateModels");
+              HookModelsGetter("AWEVideoModel", "HDRBitrateModels");
           }
-
-          #pragma mark - Discovery dump
-
-          // Один раз через ~20с после старта пишет в Documents/ttfps_methods.txt список методов
-          // плеера, связанных с fps/bitrate/gear/definition/resolution/select/stream.
-          // По нему найдём, где реально выбирается поток (30 или 60 fps).
-          static BOOL ClassInteresting(const char *n) {
-              static const char *pre[] = {"TTVideoEngine", "TTKMain", "TTKMedia", "TTKPlayer", "IESVideoPreload", "AWEVideo", NULL};
-              for (int i = 0; pre[i]; i++) if (strncmp(n, pre[i], strlen(pre[i])) == 0) return YES;
-              return NO;
-          }
-
-          static BOOL MethodInteresting(const char *n) {
-              static const char *keys[] = {"fps", "framerate", "bitrate", "gear", "definition", "resolution", "quality", "select", "choose", "stream", "playaddr", NULL};
-              for (int i = 0; keys[i]; i++) if (strcasestr(n, keys[i])) return YES;
-              return NO;
-          }
-
-          static void DumpMethods(void) {
-              static BOOL done;
-              if (done) return;
-              done = YES;
-              NSMutableString *out = [NSMutableString string];
-              NSMutableArray<NSArray<NSString *> *> *autoHooks = [NSMutableArray array];
-              unsigned cnt = 0;
-              Class *list = objc_copyClassList(&cnt);
-              int lines = 0;
-              for (unsigned i = 0; i < cnt && lines < 6000; i++) {
-                  const char *cn = class_getName(list[i]);
-                  if (!ClassInteresting(cn)) continue;
-                  for (int meta = 0; meta < 2; meta++) {
-                      Class c = meta ? object_getClass(list[i]) : list[i];
-                      unsigned mc = 0;
-                      Method *ms = class_copyMethodList(c, &mc);
-                      for (unsigned j = 0; j < mc; j++) {
-                          const char *sn = sel_getName(method_getName(ms[j]));
-                          if (!MethodInteresting(sn)) continue;
-                          const char *te = method_getTypeEncoding(ms[j]);
-                          [out appendFormat:@"%c[%s %s] %s\n", meta ? '+' : '-', cn, sn, te ? te : ""];
-                          lines++;
-                          // Сеттеры fps/framerate хукаем автоматически. Геттеры не трогаем: их дёргают на каждый кадр.
-                          if (!meta && strncmp(sn, "set", 3) == 0 && strchr(sn, ':') && strchr(sn, ':') == strrchr(sn, ':')
-                              && (strcasestr(sn, "fps") || strcasestr(sn, "framerate")))
-                              [autoHooks addObject:@[[NSString stringWithUTF8String:cn], [NSString stringWithUTF8String:sn]]];
-                      }
-                      free(ms);
-                  }
-              }
-              free(list);
-              [out enumerateLinesUsingBlock:^(NSString *l, BOOL *stop) { TTLog(@"DUMP %@", l); }];
-              TTLog(@"DUMP done: %d methods, %lu auto-hooks", lines, (unsigned long)autoHooks.count);
-              dispatch_async(dispatch_get_main_queue(), ^{
-                  for (NSArray<NSString *> *p in autoHooks) Hook(p[0].UTF8String, p[1].UTF8String, NO, 0);
-              });
-          }
-
-          #pragma mark - Share button
-
-          @interface TTFpsShare : NSObject
-          + (void)tap;
-          @end
-          @implementation TTFpsShare
-          + (void)tap {
-              NSURL *url = [NSURL fileURLWithPath:LogPath()];
-              if (![[NSFileManager defaultManager] fileExistsAtPath:LogPath()]) return;
-              UIViewController *top = nil;
-              for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-                  if (![sc isKindOfClass:UIWindowScene.class]) continue;
-                  for (UIWindow *w in ((UIWindowScene *)sc).windows) if (w.isKeyWindow) top = w.rootViewController;
-              }
-              if (!top) return;
-              while (top.presentedViewController) top = top.presentedViewController;
-              UIActivityViewController *vc = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
-              vc.popoverPresentationController.sourceView = top.view;
-              vc.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(top.view.bounds), CGRectGetMidY(top.view.bounds), 1, 1);
-              [top presentViewController:vc animated:YES completion:nil];
-          }
-          @end
-
-          @interface TTOverlayWindow : UIWindow
-          @end
-          @implementation TTOverlayWindow
-          - (BOOL)canBecomeKeyWindow { return NO; }
-          @end
-
-          static UIWindow *gOverlay;
-
-          // Кнопка живёт в собственном окне поверх всего, не зависит от key window TikTok.
-          static void AddButton(void) {
-              dispatch_async(dispatch_get_main_queue(), ^{
-                  if (gOverlay) { gOverlay.hidden = NO; return; }
-                  UIWindowScene *scene = nil;
-                  for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-                      if ([sc isKindOfClass:UIWindowScene.class]) {
-                          scene = (UIWindowScene *)sc;
-                          if (sc.activationState == UISceneActivationStateForegroundActive) break;
-                      }
-                  }
-                  if (!scene) return;
-                  CGFloat y = scene.coordinateSpace.bounds.size.height * 0.35;
-                  UIWindow *prevKey = nil;
-                  for (UIWindow *kw in scene.windows) if (kw.isKeyWindow) prevKey = kw;
-                  UIWindow *w = [[TTOverlayWindow alloc] initWithWindowScene:scene];
-                  w.frame = CGRectMake(0, y, 56, 36);
-                  w.windowLevel = UIWindowLevelAlert + 100;
-                  w.backgroundColor = UIColor.clearColor;
-                  UIViewController *vc = [UIViewController new];
-                  vc.view.backgroundColor = UIColor.clearColor;
-                  w.rootViewController = vc;
-                  UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-                  b.frame = CGRectMake(0, 0, 56, 36);
-                  b.backgroundColor = [UIColor colorWithRed:0.9 green:0.1 blue:0.1 alpha:0.85];
-                  b.layer.cornerRadius = 10;
-                  [b setTitle:@"LOG" forState:UIControlStateNormal];
-                  [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-                  b.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-                  [b addTarget:TTFpsShare.class action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
-                  [vc.view addSubview:b];
-                  w.hidden = NO;
-                  if (prevKey && !prevKey.isKeyWindow) [prevKey makeKeyWindow];
-                  gOverlay = w;
-                  TTLog(@"LOG button window added");
-              });
-          }
-
-          #pragma mark - Entry
 
           __attribute__((constructor))
           static void TTFpsInit(void) {
-              TTLog(@"TTFpsLogger loaded, forceMaxFps=%lld", kForceMaxFps);
               InstallHooks();
-              // Часть классов TikTok подгружается лениво — повторяем попытки.
+              // Часть классов подгружается лениво - повторяем попытки.
               for (int i = 1; i <= 10; i++) {
-                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                      InstallHooks();
-                      AddButton();
-                  });
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 3 * NSEC_PER_SEC)),
+                                 dispatch_get_main_queue(), ^{ InstallHooks(); });
               }
               [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                                 object:nil queue:NSOperationQueue.mainQueue
-                                                            usingBlock:^(NSNotification *n) { InstallHooks(); AddButton(); }];
+                                                            usingBlock:^(NSNotification *n) { InstallHooks(); }];
           }
+
           EOF_Tweak_m
           echo '{ Filter = { Bundles = ( "com.apple.UIKit" ); }; }' > TTLogger.plist
 
