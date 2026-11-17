@@ -28,7 +28,7 @@ jobs:
           cat > control <<'EOF_control'
           Package: com.user.ttlogger
           Name: TTLogger
-          Version: 1.0
+          Version: 1.2
           Architecture: iphoneos-arm
           Description: TikTok force 60 fps
           Maintainer: user
@@ -36,9 +36,9 @@ jobs:
           Section: Tweaks
           EOF_control
           cat > TTFpsLogger.m <<'EOF_Tweak_m'
-          // TTFpsLogger.m - финальная версия.
-          // Убирает из списка вариантов видео 30-fps копии, если среди них есть 60-fps.
-          // Без логов, без кнопок, без записи файлов.
+          // TTFpsLogger.m - v1.2
+          // Оставляет 60-fps варианты видео. Меню: маленькая плавающая кнопка "60" (можно перетаскивать).
+          // Режимы: 0 выкл, 1 авто, 2 до 720p, 3 до 1080p. Без логов.
 
           #import <Foundation/Foundation.h>
           #import <UIKit/UIKit.h>
@@ -48,6 +48,10 @@ jobs:
 
           static const long long kHighFps = 50;
           static NSMutableSet<NSString *> *gHooked;
+          static NSInteger gMode = 1;   // 0 выкл, 1 авто, 2 = 720p, 3 = 1080p
+          static NSString *const kModeKey = @"tt60_mode";
+
+          #pragma mark - Модель видео
 
           static long long ModelFps(id m) {
               SEL s = sel_registerName("fps");
@@ -55,24 +59,56 @@ jobs:
               return ((long long (*)(id, SEL))objc_msgSend)(m, s);
           }
 
-          static NSArray *FilterModels(id owner, NSArray *arr, const void *key) {
-              if (![arr isKindOfClass:NSArray.class] || arr.count < 2) return arr;
-              NSArray *cache = objc_getAssociatedObject(owner, key);
-              if (cache.count == 2 && cache[0] == arr) return cache[1];
-
-              BOOL hasHigh = NO;
-              for (id m in arr) if (ModelFps(m) >= kHighFps) { hasHigh = YES; break; }
-
-              NSArray *result = arr;
-              if (hasHigh) {
-                  NSMutableArray *keep = [NSMutableArray array];
-                  for (id m in arr) {
-                      long long f = ModelFps(m);
-                      if (f <= 0 || f >= kHighFps) [keep addObject:m]; // fps неизвестен -> не трогаем
-                  }
-                  if (keep.count > 0 && keep.count < arr.count) result = [keep copy];
+          // Высота кадра из gearName, например "adapt_lower_720_1" -> 720, "comet_540_1" -> 540. 0 = не удалось.
+          static NSInteger ModelRes(id m) {
+              SEL s = sel_registerName("gearName");
+              if (!m || ![m respondsToSelector:s]) return 0;
+              id g = ((id (*)(id, SEL))objc_msgSend)(m, s);
+              if (![g isKindOfClass:NSString.class]) return 0;
+              for (NSString *tok in [(NSString *)g componentsSeparatedByString:@"_"]) {
+                  if (tok.length < 3 || tok.length > 4) continue;
+                  NSScanner *sc = [NSScanner scannerWithString:tok];
+                  NSInteger v = 0;
+                  if ([sc scanInteger:&v] && sc.isAtEnd && v >= 144 && v <= 4320) return v;
               }
-              objc_setAssociatedObject(owner, key, @[arr, result], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+              return 0;
+          }
+
+          static NSArray *FilterModels(id owner, NSArray *arr, const void *key) {
+              NSInteger mode = gMode;
+              if (mode <= 0 || ![arr isKindOfClass:NSArray.class] || arr.count < 2) return arr;
+              NSArray *cache = objc_getAssociatedObject(owner, key);
+              if (cache.count == 3 && cache[0] == arr && [cache[2] integerValue] == mode) return cache[1];
+
+              NSMutableArray *high = [NSMutableArray array];
+              NSMutableArray *autoKeep = [NSMutableArray array];
+              for (id m in arr) {
+                  long long f = ModelFps(m);
+                  if (f >= kHighFps) [high addObject:m];
+                  if (f <= 0 || f >= kHighFps) [autoKeep addObject:m];   // fps неизвестен -> не трогаем
+              }
+              NSArray *result = arr;
+              if (high.count > 0) {
+                  if (autoKeep.count > 0 && autoKeep.count < arr.count) result = [autoKeep copy];
+                  if (mode >= 2) {
+                      NSInteger target = (mode == 2) ? 720 : 1080;
+                      NSInteger below = 0, above = 0;       // лучшее разрешение <= цели / минимальное > цели
+                      BOOL unknown = NO;
+                      for (id m in high) {
+                          NSInteger r = ModelRes(m);
+                          if (r <= 0) { unknown = YES; break; }
+                          if (r <= target) { if (r > below) below = r; }
+                          else if (above == 0 || r < above) above = r;
+                      }
+                      if (!unknown) {
+                          NSInteger want = below ? below : above;
+                          NSMutableArray *pick = [NSMutableArray array];
+                          for (id m in high) if (ModelRes(m) == want) [pick addObject:m];
+                          if (pick.count > 0) result = [pick copy];
+                      }
+                  }
+              }
+              objc_setAssociatedObject(owner, key, @[arr, result, @(mode)], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
               return result;
           }
 
@@ -104,17 +140,146 @@ jobs:
               HookModelsGetter("AWEVideoModel", "HDRBitrateModels");
           }
 
+          #pragma mark - Плавающая кнопка и меню
+
+          static NSString *const kSideKey = @"tt60_side";
+          static NSString *const kYKey = @"tt60_y";
+
+          @interface TTFpsOverlayWindow : UIWindow
+          @end
+          @implementation TTFpsOverlayWindow
+          // Пропускаем все касания мимо кнопки в TikTok; пока открыто меню - работаем как обычное окно.
+          - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+              UIView *v = [super hitTest:p withEvent:e];
+              if (self.rootViewController.presentedViewController) return v;
+              if (v == self || v == self.rootViewController.view) return nil;
+              return v;
+          }
+          @end
+
+          @interface TTFpsBtnHandler : NSObject
+          @end
+
+          static UIWindow *gOverlay;
+          static UIButton *gBtn;
+          static TTFpsBtnHandler *gHandler;
+          static NSInteger gSide = 0;      // 0 слева, 1 справа
+          static CGFloat gY = 150;
+
+          static void PlaceButton(void) {
+              UIView *host = gOverlay.rootViewController.view;
+              if (!host || !gBtn) return;
+              CGRect b = host.bounds;
+              UIEdgeInsets in = gOverlay.safeAreaInsets;
+              CGFloat sz = 40, m = 6;
+              CGFloat lo = in.top + 10, hi = b.size.height - in.bottom - sz - 10;
+              CGFloat y = MAX(lo, MIN(gY, hi));
+              CGFloat x = gSide ? b.size.width - sz - m : m;
+              gBtn.frame = CGRectMake(x, y, sz, sz);
+          }
+
+          @implementation TTFpsBtnHandler
+          - (void)tap {
+              UIViewController *vc = gOverlay.rootViewController;
+              if (!vc || vc.presentedViewController) return;
+              NSArray *titles = @[@"Выкл (как в оригинале)", @"60 fps, качество авто", @"60 fps, до 720p", @"60 fps, до 1080p"];
+              UIAlertController *a = [UIAlertController alertControllerWithTitle:@"60 FPS"
+                                                                        message:@"Действует на новые видео. Если у видео нет 60 fps, оно не меняется."
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+              for (NSInteger i = 0; i < 4; i++) {
+                  NSInteger idx = i;
+                  NSString *t = (i == gMode) ? [@"✓ " stringByAppendingString:titles[i]] : titles[i];
+                  [a addAction:[UIAlertAction actionWithTitle:t style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+                      gMode = idx;
+                      [[NSUserDefaults standardUserDefaults] setInteger:idx forKey:kModeKey];
+                  }]];
+              }
+              [a addAction:[UIAlertAction actionWithTitle:@"Спрятать кнопку до перезапуска" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+                  gBtn.hidden = YES;
+              }]];
+              [a addAction:[UIAlertAction actionWithTitle:@"Закрыть" style:UIAlertActionStyleCancel handler:nil]];
+              [vc presentViewController:a animated:YES completion:nil];
+          }
+
+          - (void)pan:(UIPanGestureRecognizer *)g {
+              UIView *host = gOverlay.rootViewController.view;
+              if (g.state == UIGestureRecognizerStateChanged) {
+                  CGPoint t = [g translationInView:host];
+                  gBtn.center = CGPointMake(gBtn.center.x + t.x, gBtn.center.y + t.y);
+                  [g setTranslation:CGPointZero inView:host];
+              } else if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
+                  gSide = gBtn.center.x > host.bounds.size.width / 2 ? 1 : 0;
+                  gY = gBtn.frame.origin.y;
+                  NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+                  [d setInteger:gSide forKey:kSideKey];
+                  [d setDouble:gY forKey:kYKey];
+                  [UIView animateWithDuration:0.2 animations:^{ PlaceButton(); }];
+              }
+          }
+          @end
+
+          static void InstallOverlay(void) {
+              if (gOverlay) return;
+              UIWindowScene *scene = nil;
+              for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                  if ([s isKindOfClass:UIWindowScene.class] && s.activationState == UISceneActivationStateForegroundActive) {
+                      scene = (UIWindowScene *)s;
+                      break;
+                  }
+              }
+              if (!scene) return;
+
+              TTFpsOverlayWindow *w = [[TTFpsOverlayWindow alloc] initWithWindowScene:scene];
+              w.windowLevel = UIWindowLevelAlert - 1;
+              w.backgroundColor = UIColor.clearColor;
+              UIViewController *vc = [UIViewController new];
+              vc.view.backgroundColor = UIColor.clearColor;
+              w.rootViewController = vc;
+
+              gHandler = [TTFpsBtnHandler new];
+              UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+              [b setTitle:@"60" forState:UIControlStateNormal];
+              [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+              b.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+              b.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45];
+              b.layer.cornerRadius = 20;
+              b.layer.borderWidth = 1;
+              b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.5].CGColor;
+              b.alpha = 0.55;
+              [b addTarget:gHandler action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
+              [b addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:gHandler action:@selector(pan:)]];
+              [vc.view addSubview:b];
+
+              gBtn = b;
+              gOverlay = w;
+              w.hidden = NO;
+              [w layoutIfNeeded];
+              PlaceButton();
+          }
+
+          static void InstallAll(void) {
+              InstallHooks();
+              InstallOverlay();
+          }
+
+          #pragma mark - Entry
+
           __attribute__((constructor))
           static void TTFpsInit(void) {
-              InstallHooks();
-              // Часть классов подгружается лениво - повторяем попытки.
+              NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+              NSNumber *saved = [d objectForKey:kModeKey];
+              if (saved && saved.integerValue >= 0 && saved.integerValue <= 3) gMode = saved.integerValue;
+              if ([d objectForKey:kSideKey]) gSide = [d integerForKey:kSideKey] ? 1 : 0;
+              if ([d objectForKey:kYKey]) gY = [d doubleForKey:kYKey];
+              InstallAll();
+              // Часть классов и сцена появляются позже - повторяем попытки.
               for (int i = 1; i <= 10; i++) {
                   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 3 * NSEC_PER_SEC)),
-                                 dispatch_get_main_queue(), ^{ InstallHooks(); });
+                                 dispatch_get_main_queue(), ^{ InstallAll(); });
               }
               [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                                 object:nil queue:NSOperationQueue.mainQueue
-                                                            usingBlock:^(NSNotification *n) { InstallHooks(); }];
+                                                            usingBlock:^(NSNotification *n) { InstallAll(); }];
           }
 
           EOF_Tweak_m
